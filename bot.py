@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sqlite3
 from datetime import datetime, timezone, timedelta
 
@@ -6,26 +7,30 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import (
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 
 # ====================== НАСТРОЙКИ ======================
-TOKEN = "8858592699:AAGdD5BGqKwTqrNeROyT0DtaIwDFoYIyRUE"
+TOKEN = os.getenv("BOT_TOKEN") or "ВСТАВЬ_СЮДА_ТОКЕН"
 
-# Юзернеймы (без @, в нижнем регистре)
+# Юзернеймы (без @, в нижнем регистре!)
 TEACHERS = {"blinova0lga"}
 ADMINS = {"l1xxoff"}
 
-# Часовой пояс Калининграда (UTC+2)
 KGD_TZ = timezone(timedelta(hours=2))
 
-# ====================== БАЗА ДАННЫХ ======================
 DB_PATH = "german_dict.db"
 
+
+# ====================== БАЗА ДАННЫХ ======================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Слова: род + слово (уникально) + перевод
     c.execute("""
         CREATE TABLE IF NOT EXISTS words (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,7 +40,6 @@ def init_db():
             added_at TEXT NOT NULL
         )
     """)
-    # ДЗ: текст и дата (одна строка)
     c.execute("""
         CREATE TABLE IF NOT EXISTS homework (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,15 +47,49 @@ def init_db():
             updated_at TEXT NOT NULL
         )
     """)
+    # NEW: таблица пользователей для рассылки
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            added_at TEXT NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
+
 
 def get_connection():
     return sqlite3.connect(DB_PATH)
 
+
+# NEW: сохранение пользователя
+def save_user(user_id: int, username: str | None, first_name: str | None):
+    conn = get_connection()
+    c = conn.cursor()
+    now = datetime.now(KGD_TZ).isoformat()
+    c.execute(
+        "INSERT OR IGNORE INTO users (user_id, username, first_name, added_at) "
+        "VALUES (?, ?, ?, ?)",
+        (user_id, username, first_name, now),
+    )
+    conn.commit()
+    conn.close()
+
+
+# NEW: получить всех пользователей для рассылки
+def get_all_users():
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users")
+    rows = c.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
 # ====================== ХЕЛПЕРЫ ======================
 def get_role(username: str | None) -> str:
-    """Возвращает 'admin', 'teacher' или 'student' (или 'guest' если None)."""
     if not username:
         return "guest"
     u = username.lower()
@@ -61,10 +99,10 @@ def get_role(username: str | None) -> str:
         return "teacher"
     return "student"
 
+
 def is_allowed(username: str | None) -> bool:
-    """Пускать ли в бота."""
-    role = get_role(username)
-    return role in ("admin", "teacher", "student")
+    return get_role(username) in ("admin", "teacher", "student")
+
 
 def get_word_count():
     conn = get_connection()
@@ -74,8 +112,8 @@ def get_word_count():
     conn.close()
     return count
 
+
 def get_last_update():
-    """Время последнего обновления (последнее добавленное слово или ДЗ)."""
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT added_at FROM words ORDER BY id DESC LIMIT 1")
@@ -85,12 +123,13 @@ def get_last_update():
     c.execute("SELECT updated_at FROM homework ORDER BY id DESC LIMIT 1")
     row = c.fetchone()
     hw_time = row[0] if row else None
-
     conn.close()
+
     times = [t for t in (word_time, hw_time) if t]
     if not times:
         return None
     return max(times)
+
 
 def get_homework():
     conn = get_connection()
@@ -100,14 +139,15 @@ def get_homework():
     conn.close()
     return row[0] if row else "ДЗ пока не задано"
 
-def add_word(article: str, word: str, translation: str):
+
+def add_word(article: str, word: str, translation: str) -> bool:
     conn = get_connection()
     c = conn.cursor()
     now = datetime.now(KGD_TZ).isoformat()
     try:
         c.execute(
             "INSERT INTO words (article, word, translation, added_at) VALUES (?, ?, ?, ?)",
-            (article, word, translation, now)
+            (article, word, translation, now),
         )
         conn.commit()
         return True
@@ -116,41 +156,43 @@ def add_word(article: str, word: str, translation: str):
     finally:
         conn.close()
 
+
 def add_homework(text: str):
     conn = get_connection()
     c = conn.cursor()
     now = datetime.now(KGD_TZ).isoformat()
     c.execute(
         "INSERT INTO homework (text, updated_at) VALUES (?, ?)",
-        (text, now)
+        (text, now),
     )
     conn.commit()
     conn.close()
 
+
 def get_letters():
-    """Уникальные первые буквы слов (род не учитывается)."""
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT DISTINCT word FROM words")
     rows = c.fetchall()
     conn.close()
-    letters = sorted({row[0][0].upper() for row in rows})
-    return letters
+    return sorted({row[0][0].upper() for row in rows if row[0]})
+
 
 def get_words_by_letter(letter: str):
-    """Слова на букву (сортировка по слову без рода)."""
     conn = get_connection()
     c = conn.cursor()
     c.execute(
-        "SELECT article, word, translation FROM words WHERE UPPER(word) LIKE ? ORDER BY word COLLATE NOCASE",
-        (f"{letter}%",)
+        "SELECT article, word, translation FROM words "
+        "WHERE UPPER(word) LIKE ? ORDER BY word COLLATE NOCASE",
+        (f"{letter}%",),
     )
     rows = c.fetchall()
     conn.close()
     return rows
 
+
 # ====================== КЛАВИАТУРЫ ======================
-def main_menu(role: str):
+def main_menu(role: str) -> ReplyKeyboardMarkup:
     buttons = [
         [KeyboardButton(text="📖 Словарь")],
         [KeyboardButton(text="ℹ️ Информация")],
@@ -159,22 +201,33 @@ def main_menu(role: str):
         buttons.append([KeyboardButton(text="➕ Добавить")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
-def letters_keyboard(letters: list[str]):
-    builder = InlineKeyboardBuilder()
+
+def letters_keyboard(letters: list[str]) -> InlineKeyboardMarkup:
+    rows = []
+    row = []
     for letter in letters:
-        builder.button(text=letter, callback_data=f"letter:{letter}")
-    builder.adjust(6)  # 6 букв в ряд
-    return builder.as_markup()
+        row.append(InlineKeyboardButton(text=letter, callback_data=f"letter:{letter}"))
+        if len(row) == 6:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def word_action_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="der", callback_data="article:der")
-    builder.button(text="die", callback_data="article:die")
-    builder.button(text="das", callback_data="article:das")
-    builder.adjust(3)
-    return builder.as_markup()
 
-def add_menu():
+def article_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="der", callback_data="article:der"),
+                InlineKeyboardButton(text="die", callback_data="article:die"),
+                InlineKeyboardButton(text="das", callback_data="article:das"),
+            ]
+        ]
+    )
+
+
+def add_menu() -> ReplyKeyboardMarkup:
     buttons = [
         [KeyboardButton(text="📝 Добавить слово")],
         [KeyboardButton(text="📚 Добавить ДЗ")],
@@ -182,22 +235,64 @@ def add_menu():
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
+
+def cancel_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ Отмена")]],
+        resize_keyboard=True,
+    )
+
+
 # ====================== FSM ======================
 class AddWord(StatesGroup):
     article = State()
     word = State()
     translation = State()
 
+
 class AddHW(StatesGroup):
     text = State()
 
-# ====================== ХЕНДЛЕРЫ ======================
+
+# ====================== БОТ ======================
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Проверка доступа на /start
+
+# NEW: рассылка всем пользователям
+async def broadcast_new_word(article: str, word: str, translation: str):
+    text = (
+        f"🆕 <b>Добавлено новое слово!</b>\n\n"
+        f"<b>{article} {word}</b> — {translation}"
+    )
+    user_ids = get_all_users()
+    for uid in user_ids:
+        try:
+            await bot.send_message(uid, text, parse_mode="HTML")
+        except TelegramForbiddenError:
+            # Пользователь заблокировал бота — пропускаем
+            pass
+        except TelegramBadRequest:
+            # Чат недоступен — пропускаем
+            pass
+        except Exception:
+            pass
+        # Небольшая пауза, чтобы не словить flood-лимит
+        await asyncio.sleep(0.05)
+
+
+# ---------- /start ----------
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
+
+    # NEW: сохраняем пользователя
+    save_user(
+        message.from_user.id,
+        message.from_user.username,
+        message.from_user.first_name,
+    )
+
     username = message.from_user.username
     if not is_allowed(username):
         await message.answer(
@@ -210,24 +305,28 @@ async def cmd_start(message: types.Message):
     await message.answer(
         f"Привет, {message.from_user.first_name}! 👋\n"
         f"Твоя роль: {role}",
-        reply_markup=main_menu(role)
+        reply_markup=main_menu(role),
     )
 
-# Главное меню: Словарь
+
+# ---------- Словарь ----------
 @dp.message(F.text == "📖 Словарь")
-async def show_dictionary(message: types.Message):
+async def show_dictionary(message: types.Message, state: FSMContext):
     if not is_allowed(message.from_user.username):
         return
+    await state.clear()
+
     letters = get_letters()
     if not letters:
         await message.answer("Словарь пуст. Учитель ещё не добавил слова.")
         return
+
     await message.answer(
         "Выбери первую букву слова:",
-        reply_markup=letters_keyboard(letters)
+        reply_markup=letters_keyboard(letters),
     )
 
-# Callback: нажата буква
+
 @dp.callback_query(F.data.startswith("letter:"))
 async def show_words(callback: types.CallbackQuery):
     if not is_allowed(callback.from_user.username):
@@ -242,20 +341,20 @@ async def show_words(callback: types.CallbackQuery):
         await callback.answer()
         return
 
-    # Формируем текст: перед словом род, но алфавитный порядок не нарушается
     lines = [f"<b>Слова на «{letter}»</b>\n"]
     for article, word, translation in words:
         lines.append(f"<b>{article}</b> {word} — {translation}")
 
     text = "\n".join(lines)
-    # Добавляем кнопку назад
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔙 К буквам", callback_data="back_to_letters")
-
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
+    back_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 К буквам", callback_data="back_to_letters")]
+        ]
+    )
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_kb)
     await callback.answer()
 
-# Callback: назад к списку букв
+
 @dp.callback_query(F.data == "back_to_letters")
 async def back_to_letters(callback: types.CallbackQuery):
     if not is_allowed(callback.from_user.username):
@@ -263,11 +362,12 @@ async def back_to_letters(callback: types.CallbackQuery):
     letters = get_letters()
     await callback.message.edit_text(
         "Выбери первую букву слова:",
-        reply_markup=letters_keyboard(letters)
+        reply_markup=letters_keyboard(letters),
     )
     await callback.answer()
 
-# Информация
+
+# ---------- Информация ----------
 @dp.message(F.text == "ℹ️ Информация")
 async def show_info(message: types.Message):
     if not is_allowed(message.from_user.username):
@@ -294,92 +394,177 @@ async def show_info(message: types.Message):
     )
     await message.answer(text, parse_mode="HTML")
 
-# Добавить (только учитель/админ)
+
+# ---------- Меню «Добавить» ----------
 @dp.message(F.text == "➕ Добавить")
-async def add_menu_handler(message: types.Message):
+async def add_menu_handler(message: types.Message, state: FSMContext):
     role = get_role(message.from_user.username)
     if role not in ("admin", "teacher"):
         return
+    await state.clear()
     await message.answer("Что добавить?", reply_markup=add_menu())
 
+
+# ---------- Добавить слово ----------
 @dp.message(F.text == "📝 Добавить слово")
 async def add_word_start(message: types.Message, state: FSMContext):
     role = get_role(message.from_user.username)
     if role not in ("admin", "teacher"):
         return
+
     await state.set_state(AddWord.article)
     await message.answer(
         "Выбери род нового слова:",
-        reply_markup=word_action_keyboard()
+        reply_markup=article_keyboard(),
     )
 
-@dp.callback_query(F.data.startswith("article:"), AddWord.article)
+
+@dp.callback_query(F.data.startswith("article:"))
 async def add_word_article(callback: types.CallbackQuery, state: FSMContext):
+    role = get_role(callback.from_user.username)
+    if role not in ("admin", "teacher"):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    current_state = await state.get_state()
+    if current_state != AddWord.article.state:
+        await callback.answer(
+            "Сначала нажми «📝 Добавить слово»", show_alert=True
+        )
+        return
+
     article = callback.data.split(":")[1]
     await state.update_data(article=article)
     await state.set_state(AddWord.word)
+
     await callback.message.edit_text(
-        f"Род: <b>{article}</b>\n\nТеперь напиши само слово (можно с умлаутами):",
-        parse_mode="HTML"
+        f"Род: <b>{article}</b>\n\n"
+        f"Теперь напиши само слово (можно с умлаутами):",
+        parse_mode="HTML",
     )
     await callback.answer()
 
+
 @dp.message(AddWord.word)
 async def add_word_word(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        role = get_role(message.from_user.username)
+        await message.answer("Отменено.", reply_markup=main_menu(role))
+        return
+
     await state.update_data(word=message.text.strip())
     await state.set_state(AddWord.translation)
-    await message.answer("Теперь напиши перевод:")
+    await message.answer(
+        "Теперь напиши перевод:", reply_markup=cancel_keyboard()
+    )
+
 
 @dp.message(AddWord.translation)
 async def add_word_translation(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        role = get_role(message.from_user.username)
+        await message.answer("Отменено.", reply_markup=main_menu(role))
+        return
+
     data = await state.get_data()
     translation = message.text.strip()
+    article = data["article"]
+    word = data["word"]
 
-    success = add_word(data["article"], data["word"], translation)
+    success = add_word(article, word, translation)
+    role = get_role(message.from_user.username)
 
     if success:
         await message.answer(
-            f"✅ Добавлено: <b>{data['article']} {data['word']}</b> — {translation}",
+            f"✅ Добавлено: <b>{article} {word}</b> — {translation}",
             parse_mode="HTML",
-            reply_markup=main_menu(get_role(message.from_user.username))
+            reply_markup=main_menu(role),
         )
+        # NEW: рассылка всем пользователям
+        await broadcast_new_word(article, word, translation)
     else:
         await message.answer(
-            f"❌ Слово «{data['word']}» уже есть в словаре.",
-            reply_markup=main_menu(get_role(message.from_user.username))
+            f"❌ Слово «{word}» уже есть в словаре.",
+            reply_markup=main_menu(role),
         )
     await state.clear()
 
+
+# ---------- Добавить ДЗ ----------
 @dp.message(F.text == "📚 Добавить ДЗ")
 async def add_hw_start(message: types.Message, state: FSMContext):
     role = get_role(message.from_user.username)
     if role not in ("admin", "teacher"):
         return
+
     await state.set_state(AddHW.text)
     await message.answer(
         "Напиши ДЗ на следующий урок и дату одним сообщением.\n"
-        "Пример: <i>Упражнение 5 стр. 23, повторить слова. К 15.11</i>",
-        parse_mode="HTML"
+        "Пример: <i>Упражнение 5 стр. 23, повторить слова. К 15.11</i>\n\n"
+        "Или нажми «❌ Отмена».",
+        parse_mode="HTML",
+        reply_markup=cancel_keyboard(),
     )
+
 
 @dp.message(AddHW.text)
 async def add_hw_text(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        role = get_role(message.from_user.username)
+        await message.answer("Отменено.", reply_markup=main_menu(role))
+        return
+
     add_homework(message.text.strip())
+    role = get_role(message.from_user.username)
     await message.answer(
         "✅ ДЗ сохранено.",
-        reply_markup=main_menu(get_role(message.from_user.username))
+        reply_markup=main_menu(role),
     )
     await state.clear()
 
+
+# ---------- Назад ----------
 @dp.message(F.text == "🔙 Назад")
-async def back_to_main(message: types.Message):
+async def back_to_main(message: types.Message, state: FSMContext):
+    await state.clear()
     role = get_role(message.from_user.username)
     await message.answer("Главное меню", reply_markup=main_menu(role))
+
+
+# ---------- Фоллбэк ----------
+@dp.message()
+async def fallback(message: types.Message, state: FSMContext):
+    # NEW: даже при фоллбэке сохраняем пользователя, если он не в FSM
+    current_state = await state.get_state()
+    if current_state is not None:
+        return
+
+    # Сохраняем любого, кто написал боту (даже не через /start)
+    save_user(
+        message.from_user.id,
+        message.from_user.username,
+        message.from_user.first_name,
+    )
+
+    if not is_allowed(message.from_user.username):
+        return
+
+    role = get_role(message.from_user.username)
+    await message.answer(
+        "Не понял команду. Используй кнопки ниже.",
+        reply_markup=main_menu(role),
+    )
+
 
 # ====================== ЗАПУСК ======================
 async def main():
     init_db()
+    print("Bot started")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
