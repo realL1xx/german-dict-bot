@@ -24,7 +24,7 @@ ADMINS = {"l1xxoff"}
 
 KGD_TZ = timezone(timedelta(hours=2))
 
-DB_PATH = "german_dict.db"
+DB_PATH = "/app/data/german_dict.db"
 
 
 # ====================== БАЗА ДАННЫХ ======================
