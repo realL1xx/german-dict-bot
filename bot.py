@@ -18,17 +18,20 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 # ====================== НАСТРОЙКИ ======================
 TOKEN = os.getenv("BOT_TOKEN") or "ВСТАВЬ_СЮДА_ТОКЕН"
 
-# Юзернеймы (без @, в нижнем регистре!)
 TEACHERS = {"blinova0lga"}
 ADMINS = {"l1xxoff"}
 
 KGD_TZ = timezone(timedelta(hours=2))
 
+# NEW: постоянное хранилище Bothost
 DB_PATH = "/app/data/german_dict.db"
 
 
 # ====================== БАЗА ДАННЫХ ======================
 def init_db():
+    # NEW: гарантируем наличие папки
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
@@ -47,7 +50,6 @@ def init_db():
             updated_at TEXT NOT NULL
         )
     """)
-    # NEW: таблица пользователей для рассылки
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -64,7 +66,6 @@ def get_connection():
     return sqlite3.connect(DB_PATH)
 
 
-# NEW: сохранение пользователя
 def save_user(user_id: int, username: str | None, first_name: str | None):
     conn = get_connection()
     c = conn.cursor()
@@ -78,7 +79,6 @@ def save_user(user_id: int, username: str | None, first_name: str | None):
     conn.close()
 
 
-# NEW: получить всех пользователей для рассылки
 def get_all_users():
     conn = get_connection()
     c = conn.cursor()
@@ -191,6 +191,13 @@ def get_words_by_letter(letter: str):
     return rows
 
 
+# NEW: форматирование строки слова с учётом «нету»
+def format_word(article: str, word: str, translation: str) -> str:
+    if article == "none":
+        return f"<b>{word}</b> — {translation}"
+    return f"<b>{article} {word}</b> — {translation}"
+
+
 # ====================== КЛАВИАТУРЫ ======================
 def main_menu(role: str) -> ReplyKeyboardMarkup:
     buttons = [
@@ -215,6 +222,7 @@ def letters_keyboard(letters: list[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+# NEW: добавлена кнопка «нету»
 def article_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -222,7 +230,10 @@ def article_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="der", callback_data="article:der"),
                 InlineKeyboardButton(text="die", callback_data="article:die"),
                 InlineKeyboardButton(text="das", callback_data="article:das"),
-            ]
+            ],
+            [
+                InlineKeyboardButton(text="нету", callback_data="article:none"),
+            ],
         ]
     )
 
@@ -259,25 +270,28 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 
-# NEW: рассылка всем пользователям
 async def broadcast_new_word(article: str, word: str, translation: str):
-    text = (
-        f"🆕 <b>Добавлено новое слово!</b>\n\n"
-        f"<b>{article} {word}</b> — {translation}"
-    )
+    if article == "none":
+        text = (
+            f"🆕 <b>Добавлено новое слово!</b>\n\n"
+            f"<b>{word}</b> — {translation}"
+        )
+    else:
+        text = (
+            f"🆕 <b>Добавлено новое слово!</b>\n\n"
+            f"<b>{article} {word}</b> — {translation}"
+        )
+
     user_ids = get_all_users()
     for uid in user_ids:
         try:
             await bot.send_message(uid, text, parse_mode="HTML")
         except TelegramForbiddenError:
-            # Пользователь заблокировал бота — пропускаем
             pass
         except TelegramBadRequest:
-            # Чат недоступен — пропускаем
             pass
         except Exception:
             pass
-        # Небольшая пауза, чтобы не словить flood-лимит
         await asyncio.sleep(0.05)
 
 
@@ -285,8 +299,6 @@ async def broadcast_new_word(article: str, word: str, translation: str):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
-
-    # NEW: сохраняем пользователя
     save_user(
         message.from_user.id,
         message.from_user.username,
@@ -343,7 +355,8 @@ async def show_words(callback: types.CallbackQuery):
 
     lines = [f"<b>Слова на «{letter}»</b>\n"]
     for article, word, translation in words:
-        lines.append(f"<b>{article}</b> {word} — {translation}")
+        # NEW: используем format_word
+        lines.append(format_word(article, word, translation))
 
     text = "\n".join(lines)
     back_kb = InlineKeyboardMarkup(
@@ -414,7 +427,7 @@ async def add_word_start(message: types.Message, state: FSMContext):
 
     await state.set_state(AddWord.article)
     await message.answer(
-        "Выбери род нового слова:",
+        "Выбери род нового слова (или «нету», если рода нет):",
         reply_markup=article_keyboard(),
     )
 
@@ -437,11 +450,13 @@ async def add_word_article(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(article=article)
     await state.set_state(AddWord.word)
 
-    await callback.message.edit_text(
-        f"Род: <b>{article}</b>\n\n"
-        f"Теперь напиши само слово (можно с умлаутами):",
-        parse_mode="HTML",
-    )
+    # NEW: разный текст в зависимости от выбора
+    if article == "none":
+        prompt = "Род: <b>нету</b>\n\nТеперь напиши само слово (можно с умлаутами):"
+    else:
+        prompt = f"Род: <b>{article}</b>\n\nТеперь напиши само слово (можно с умлаутами):"
+
+    await callback.message.edit_text(prompt, parse_mode="HTML")
     await callback.answer()
 
 
@@ -477,12 +492,17 @@ async def add_word_translation(message: types.Message, state: FSMContext):
     role = get_role(message.from_user.username)
 
     if success:
+        # NEW: показываем слово с учётом «нету»
+        if article == "none":
+            display = f"<b>{word}</b> — {translation}"
+        else:
+            display = f"<b>{article} {word}</b> — {translation}"
+
         await message.answer(
-            f"✅ Добавлено: <b>{article} {word}</b> — {translation}",
+            f"✅ Добавлено: {display}",
             parse_mode="HTML",
             reply_markup=main_menu(role),
         )
-        # NEW: рассылка всем пользователям
         await broadcast_new_word(article, word, translation)
     else:
         await message.answer(
@@ -537,12 +557,10 @@ async def back_to_main(message: types.Message, state: FSMContext):
 # ---------- Фоллбэк ----------
 @dp.message()
 async def fallback(message: types.Message, state: FSMContext):
-    # NEW: даже при фоллбэке сохраняем пользователя, если он не в FSM
     current_state = await state.get_state()
     if current_state is not None:
         return
 
-    # Сохраняем любого, кто написал боту (даже не через /start)
     save_user(
         message.from_user.id,
         message.from_user.username,
