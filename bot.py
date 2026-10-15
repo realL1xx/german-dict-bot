@@ -23,13 +23,14 @@ ADMINS = {"l1xxoff"}
 
 KGD_TZ = timezone(timedelta(hours=2))
 
-# NEW: постоянное хранилище Bothost
 DB_PATH = "/app/data/german_dict.db"
+
+# NEW: сколько дней хранить в «недавних»
+RECENT_DAYS = 8
 
 
 # ====================== БАЗА ДАННЫХ ======================
 def init_db():
-    # NEW: гарантируем наличие папки
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
     conn = sqlite3.connect(DB_PATH)
@@ -157,6 +158,23 @@ def add_word(article: str, word: str, translation: str) -> bool:
         conn.close()
 
 
+# NEW: удаление слова по id
+def delete_word_by_id(word_id: int) -> tuple[bool, str, str, str]:
+    """Возвращает (success, article, word, translation)."""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT article, word, translation FROM words WHERE id = ?", (word_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return False, "", "", ""
+    article, word, translation = row
+    c.execute("DELETE FROM words WHERE id = ?", (word_id,))
+    conn.commit()
+    conn.close()
+    return True, article, word, translation
+
+
 def add_homework(text: str):
     conn = get_connection()
     c = conn.cursor()
@@ -182,7 +200,7 @@ def get_words_by_letter(letter: str):
     conn = get_connection()
     c = conn.cursor()
     c.execute(
-        "SELECT article, word, translation FROM words "
+        "SELECT id, article, word, translation FROM words "
         "WHERE UPPER(word) LIKE ? ORDER BY word COLLATE NOCASE",
         (f"{letter}%",),
     )
@@ -191,11 +209,42 @@ def get_words_by_letter(letter: str):
     return rows
 
 
-# NEW: форматирование строки слова с учётом «нету»
-def format_word(article: str, word: str, translation: str) -> str:
+# NEW: все слова (для кнопки «Все слова»)
+def get_all_words():
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, article, word, translation FROM words ORDER BY word COLLATE NOCASE"
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+# NEW: недавние слова (за последние RECENT_DAYS дней), по алфавиту
+def get_recent_words():
+    conn = get_connection()
+    c = conn.cursor()
+    threshold = (datetime.now(KGD_TZ) - timedelta(days=RECENT_DAYS)).isoformat()
+    c.execute(
+        "SELECT id, article, word, translation FROM words "
+        "WHERE added_at >= ? ORDER BY word COLLATE NOCASE",
+        (threshold,),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+# NEW: форматирование строки слова
+def format_word(article: str, word: str, translation: str, html: bool = True) -> str:
     if article == "none":
-        return f"<b>{word}</b> — {translation}"
-    return f"<b>{article} {word}</b> — {translation}"
+        if html:
+            return f"<b>{word}</b> — {translation}"
+        return f"{word} — {translation}"
+    if html:
+        return f"<b>{article} {word}</b> — {translation}"
+    return f"{article} {word} — {translation}"
 
 
 # ====================== КЛАВИАТУРЫ ======================
@@ -209,7 +258,8 @@ def main_menu(role: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 
-def letters_keyboard(letters: list[str]) -> InlineKeyboardMarkup:
+# NEW: клавиатура словаря — добавлена кнопка «Все слова»
+def dictionary_keyboard(letters: list[str], role: str) -> InlineKeyboardMarkup:
     rows = []
     row = []
     for letter in letters:
@@ -219,10 +269,19 @@ def letters_keyboard(letters: list[str]) -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
+
+    # Кнопка «Все слова» внизу
+    rows.append([InlineKeyboardButton(text="📚 Все слова", callback_data="all_words")])
+
+    # NEW: кнопка удаления — только для учителя/админа
+    if role in ("admin", "teacher"):
+        rows.append(
+            [InlineKeyboardButton(text="🗑 Удалить слово", callback_data="delete_start")]
+        )
+
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# NEW: добавлена кнопка «нету»
 def article_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -254,6 +313,35 @@ def cancel_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+# NEW: клавиатура списка слов для удаления
+def delete_words_keyboard(words: list) -> InlineKeyboardMarkup:
+    rows = []
+    for word_id, article, word, translation in words:
+        if article == "none":
+            label = word
+        else:
+            label = f"{article} {word}"
+        # Telegram ограничивает длину callback_data (64 байта) — id короткий, ок
+        rows.append(
+            [InlineKeyboardButton(text=label, callback_data=f"del_word:{word_id}")]
+        )
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="delete_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def confirm_delete_keyboard(word_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Да, удалить", callback_data=f"del_confirm:{word_id}"
+                ),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="delete_back"),
+            ]
+        ]
+    )
+
+
 # ====================== FSM ======================
 class AddWord(StatesGroup):
     article = State()
@@ -271,28 +359,59 @@ dp = Dispatcher()
 
 
 async def broadcast_new_word(article: str, word: str, translation: str):
-    if article == "none":
-        text = (
-            f"🆕 <b>Добавлено новое слово!</b>\n\n"
-            f"<b>{word}</b> — {translation}"
-        )
-    else:
-        text = (
-            f"🆕 <b>Добавлено новое слово!</b>\n\n"
-            f"<b>{article} {word}</b> — {translation}"
-        )
-
-    user_ids = get_all_users()
-    for uid in user_ids:
+    text = (
+        f"🆕 <b>Добавлено новое слово!</b>\n\n"
+        f"{format_word(article, word, translation)}"
+    )
+    for uid in get_all_users():
         try:
             await bot.send_message(uid, text, parse_mode="HTML")
-        except TelegramForbiddenError:
-            pass
-        except TelegramBadRequest:
+        except (TelegramForbiddenError, TelegramBadRequest):
             pass
         except Exception:
             pass
         await asyncio.sleep(0.05)
+
+
+# NEW: рассылка об удалении
+async def broadcast_deleted_word(article: str, word: str, translation: str):
+    if article == "none":
+        display = f"<b>{word}</b>"
+    else:
+        display = f"<b>{article} {word}</b>"
+    text = (
+        f"🗑 <b>Слово удалено из словаря</b>\n\n"
+        f"{display} — {translation}"
+    )
+    for uid in get_all_users():
+        try:
+            await bot.send_message(uid, text, parse_mode="HTML")
+        except (TelegramForbiddenError, TelegramBadRequest):
+            pass
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
+
+
+# NEW: отправка длинного текста частями
+async def send_long_message(message: types.Message, text: str, reply_markup=None):
+    """Разбивает длинный текст на куски по 4000 символов."""
+    LIMIT = 4000
+    parts = []
+    while len(text) > LIMIT:
+        # ищем последний перенос строки в пределах лимита
+        cut = text.rfind("\n", 0, LIMIT)
+        if cut == -1:
+            cut = LIMIT
+        parts.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    parts.append(text)
+
+    for i, part in enumerate(parts):
+        if i == len(parts) - 1 and reply_markup is not None:
+            await message.answer(part, parse_mode="HTML", reply_markup=reply_markup)
+        else:
+            await message.answer(part, parse_mode="HTML")
 
 
 # ---------- /start ----------
@@ -328,14 +447,25 @@ async def show_dictionary(message: types.Message, state: FSMContext):
         return
     await state.clear()
 
+    role = get_role(message.from_user.username)
+
+    # NEW: сначала показываем недавние слова (за 8 дней)
+    recent = get_recent_words()
+    if recent:
+        lines = [f"🕒 <b>Недавние слова (за {RECENT_DAYS} дней):</b>\n"]
+        for _, article, word, translation in recent:
+            lines.append(format_word(article, word, translation))
+        recent_text = "\n".join(lines)
+        await send_long_message(message, recent_text)
+
     letters = get_letters()
     if not letters:
         await message.answer("Словарь пуст. Учитель ещё не добавил слова.")
         return
 
     await message.answer(
-        "Выбери первую букву слова:",
-        reply_markup=letters_keyboard(letters),
+        "Выбери первую букву слова или нажми «Все слова»:",
+        reply_markup=dictionary_keyboard(letters, role),
     )
 
 
@@ -354,8 +484,7 @@ async def show_words(callback: types.CallbackQuery):
         return
 
     lines = [f"<b>Слова на «{letter}»</b>\n"]
-    for article, word, translation in words:
-        # NEW: используем format_word
+    for _, article, word, translation in words:
         lines.append(format_word(article, word, translation))
 
     text = "\n".join(lines)
@@ -368,14 +497,59 @@ async def show_words(callback: types.CallbackQuery):
     await callback.answer()
 
 
+# NEW: «Все слова» — выводим всё сразу
+@dp.callback_query(F.data == "all_words")
+async def show_all_words(callback: types.CallbackQuery):
+    if not is_allowed(callback.from_user.username):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    words = get_all_words()
+    if not words:
+        await callback.message.edit_text("Словарь пуст.")
+        await callback.answer()
+        return
+
+    lines = [f"📚 <b>Все слова ({len(words)})</b>\n"]
+
+    # Группируем по первой букве
+    current_letter = None
+    for _, article, word, translation in words:
+        first = word[0].upper()
+        if first != current_letter:
+            if current_letter is not None:
+                lines.append("")  # пустая строка между группами
+            lines.append(f"— <b>{first}</b> —")
+            current_letter = first
+        lines.append(format_word(article, word, translation))
+
+    text = "\n".join(lines)
+
+    back_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 К буквам", callback_data="back_to_letters")]
+        ]
+    )
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_kb)
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "back_to_letters")
 async def back_to_letters(callback: types.CallbackQuery):
     if not is_allowed(callback.from_user.username):
         return
+    role = get_role(callback.from_user.username)
     letters = get_letters()
+
+    if not letters:
+        await callback.message.edit_text("Словарь пуст.")
+        await callback.answer()
+        return
+
     await callback.message.edit_text(
-        "Выбери первую букву слова:",
-        reply_markup=letters_keyboard(letters),
+        "Выбери первую букву слова или нажми «Все слова»:",
+        reply_markup=dictionary_keyboard(letters, role),
     )
     await callback.answer()
 
@@ -450,7 +624,6 @@ async def add_word_article(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(article=article)
     await state.set_state(AddWord.word)
 
-    # NEW: разный текст в зависимости от выбора
     if article == "none":
         prompt = "Род: <b>нету</b>\n\nТеперь напиши само слово (можно с умлаутами):"
     else:
@@ -492,12 +665,7 @@ async def add_word_translation(message: types.Message, state: FSMContext):
     role = get_role(message.from_user.username)
 
     if success:
-        # NEW: показываем слово с учётом «нету»
-        if article == "none":
-            display = f"<b>{word}</b> — {translation}"
-        else:
-            display = f"<b>{article} {word}</b> — {translation}"
-
+        display = format_word(article, word, translation)
         await message.answer(
             f"✅ Добавлено: {display}",
             parse_mode="HTML",
@@ -510,6 +678,129 @@ async def add_word_translation(message: types.Message, state: FSMContext):
             reply_markup=main_menu(role),
         )
     await state.clear()
+
+
+# ---------- NEW: Удаление слов ----------
+@dp.callback_query(F.data == "delete_start")
+async def delete_start(callback: types.CallbackQuery):
+    role = get_role(callback.from_user.username)
+    if role not in ("admin", "teacher"):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    letters = get_letters()
+    if not letters:
+        await callback.answer("Словарь пуст", show_alert=True)
+        return
+
+    rows = []
+    row = []
+    for letter in letters:
+        row.append(InlineKeyboardButton(text=letter, callback_data=f"del_letter:{letter}"))
+        if len(row) == 6:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_letters")])
+
+    await callback.message.edit_text(
+        "Выбери букву слова, которое нужно удалить:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("del_letter:"))
+async def delete_letter(callback: types.CallbackQuery):
+    role = get_role(callback.from_user.username)
+    if role not in ("admin", "teacher"):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    letter = callback.data.split(":")[1]
+    words = get_words_by_letter(letter)
+
+    if not words:
+        await callback.answer("На эту букву слов нет", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"Выбери слово на «{letter}» для удаления:",
+        reply_markup=delete_words_keyboard(words),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("del_word:"))
+async def delete_word_confirm(callback: types.CallbackQuery):
+    role = get_role(callback.from_user.username)
+    if role not in ("admin", "teacher"):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    word_id = int(callback.data.split(":")[1])
+
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT article, word, translation FROM words WHERE id = ?", (word_id,))
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        await callback.answer("Слово не найдено", show_alert=True)
+        return
+
+    article, word, translation = row
+    display = format_word(article, word, translation)
+
+    await callback.message.edit_text(
+        f"Удалить это слово?\n\n{display}",
+        parse_mode="HTML",
+        reply_markup=confirm_delete_keyboard(word_id),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("del_confirm:"))
+async def delete_word_do(callback: types.CallbackQuery):
+    role = get_role(callback.from_user.username)
+    if role not in ("admin", "teacher"):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    word_id = int(callback.data.split(":")[1])
+    success, article, word, translation = delete_word_by_id(word_id)
+
+    if not success:
+        await callback.answer("Слово уже удалено", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"🗑 Удалено: {format_word(article, word, translation)}",
+        parse_mode="HTML",
+    )
+    await callback.answer("Удалено")
+    await broadcast_deleted_word(article, word, translation)
+
+
+@dp.callback_query(F.data == "delete_back")
+async def delete_back(callback: types.CallbackQuery):
+    if not is_allowed(callback.from_user.username):
+        return
+    role = get_role(callback.from_user.username)
+    letters = get_letters()
+
+    if not letters:
+        await callback.message.edit_text("Словарь пуст.")
+        await callback.answer()
+        return
+
+    await callback.message.edit_text(
+        "Выбери первую букву слова или нажми «Все слова»:",
+        reply_markup=dictionary_keyboard(letters, role),
+    )
+    await callback.answer()
 
 
 # ---------- Добавить ДЗ ----------
