@@ -25,7 +25,6 @@ KGD_TZ = timezone(timedelta(hours=2))
 
 DB_PATH = "/app/data/german_dict.db"
 
-# NEW: сколько дней хранить в «недавних»
 RECENT_DAYS = 8
 
 
@@ -158,9 +157,7 @@ def add_word(article: str, word: str, translation: str) -> bool:
         conn.close()
 
 
-# NEW: удаление слова по id
 def delete_word_by_id(word_id: int) -> tuple[bool, str, str, str]:
-    """Возвращает (success, article, word, translation)."""
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT article, word, translation FROM words WHERE id = ?", (word_id,))
@@ -209,7 +206,6 @@ def get_words_by_letter(letter: str):
     return rows
 
 
-# NEW: все слова (для кнопки «Все слова»)
 def get_all_words():
     conn = get_connection()
     c = conn.cursor()
@@ -221,7 +217,6 @@ def get_all_words():
     return rows
 
 
-# NEW: недавние слова (за последние RECENT_DAYS дней), по алфавиту
 def get_recent_words():
     conn = get_connection()
     c = conn.cursor()
@@ -236,7 +231,6 @@ def get_recent_words():
     return rows
 
 
-# NEW: форматирование строки слова
 def format_word(article: str, word: str, translation: str, html: bool = True) -> str:
     if article == "none":
         if html:
@@ -255,10 +249,11 @@ def main_menu(role: str) -> ReplyKeyboardMarkup:
     ]
     if role in ("admin", "teacher"):
         buttons.append([KeyboardButton(text="➕ Добавить")])
+    if role == "admin":
+        buttons.append([KeyboardButton(text="🛠 Диагностика")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 
-# NEW: клавиатура словаря — добавлена кнопка «Все слова»
 def dictionary_keyboard(letters: list[str], role: str) -> InlineKeyboardMarkup:
     rows = []
     row = []
@@ -270,10 +265,8 @@ def dictionary_keyboard(letters: list[str], role: str) -> InlineKeyboardMarkup:
     if row:
         rows.append(row)
 
-    # Кнопка «Все слова» внизу
     rows.append([InlineKeyboardButton(text="📚 Все слова", callback_data="all_words")])
 
-    # NEW: кнопка удаления — только для учителя/админа
     if role in ("admin", "teacher"):
         rows.append(
             [InlineKeyboardButton(text="🗑 Удалить слово", callback_data="delete_start")]
@@ -306,6 +299,17 @@ def add_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 
+def diagnostic_menu() -> ReplyKeyboardMarkup:
+    buttons = [
+        [KeyboardButton(text="▶️ Старт")],
+        [KeyboardButton(text="🔄 Обновление")],
+        [KeyboardButton(text="📢 Рассылка")],
+        [KeyboardButton(text="⏹ Конец")],
+        [KeyboardButton(text="🔙 Назад")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+
 def cancel_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="❌ Отмена")]],
@@ -313,7 +317,6 @@ def cancel_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-# NEW: клавиатура списка слов для удаления
 def delete_words_keyboard(words: list) -> InlineKeyboardMarkup:
     rows = []
     for word_id, article, word, translation in words:
@@ -321,7 +324,6 @@ def delete_words_keyboard(words: list) -> InlineKeyboardMarkup:
             label = word
         else:
             label = f"{article} {word}"
-        # Telegram ограничивает длину callback_data (64 байта) — id короткий, ок
         rows.append(
             [InlineKeyboardButton(text=label, callback_data=f"del_word:{word_id}")]
         )
@@ -353,16 +355,17 @@ class AddHW(StatesGroup):
     text = State()
 
 
+class Broadcast(StatesGroup):
+    update_text = State()
+    custom_text = State()
+
+
 # ====================== БОТ ======================
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 
-async def broadcast_new_word(article: str, word: str, translation: str):
-    text = (
-        f"🆕 <b>Добавлено новое слово!</b>\n\n"
-        f"{format_word(article, word, translation)}"
-    )
+async def broadcast_text(text: str):
     for uid in get_all_users():
         try:
             await bot.send_message(uid, text, parse_mode="HTML")
@@ -373,7 +376,14 @@ async def broadcast_new_word(article: str, word: str, translation: str):
         await asyncio.sleep(0.05)
 
 
-# NEW: рассылка об удалении
+async def broadcast_new_word(article: str, word: str, translation: str):
+    text = (
+        f"🆕 <b>Добавлено новое слово!</b>\n\n"
+        f"{format_word(article, word, translation)}"
+    )
+    await broadcast_text(text)
+
+
 async def broadcast_deleted_word(article: str, word: str, translation: str):
     if article == "none":
         display = f"<b>{word}</b>"
@@ -383,23 +393,13 @@ async def broadcast_deleted_word(article: str, word: str, translation: str):
         f"🗑 <b>Слово удалено из словаря</b>\n\n"
         f"{display} — {translation}"
     )
-    for uid in get_all_users():
-        try:
-            await bot.send_message(uid, text, parse_mode="HTML")
-        except (TelegramForbiddenError, TelegramBadRequest):
-            pass
-        except Exception:
-            pass
-        await asyncio.sleep(0.05)
+    await broadcast_text(text)
 
 
-# NEW: отправка длинного текста частями
 async def send_long_message(message: types.Message, text: str, reply_markup=None):
-    """Разбивает длинный текст на куски по 4000 символов."""
     LIMIT = 4000
     parts = []
     while len(text) > LIMIT:
-        # ищем последний перенос строки в пределах лимита
         cut = text.rfind("\n", 0, LIMIT)
         if cut == -1:
             cut = LIMIT
@@ -449,7 +449,6 @@ async def show_dictionary(message: types.Message, state: FSMContext):
 
     role = get_role(message.from_user.username)
 
-    # NEW: сначала показываем недавние слова (за 8 дней)
     recent = get_recent_words()
     if recent:
         lines = [f"🕒 <b>Недавние слова (за {RECENT_DAYS} дней):</b>\n"]
@@ -497,7 +496,6 @@ async def show_words(callback: types.CallbackQuery):
     await callback.answer()
 
 
-# NEW: «Все слова» — выводим всё сразу
 @dp.callback_query(F.data == "all_words")
 async def show_all_words(callback: types.CallbackQuery):
     if not is_allowed(callback.from_user.username):
@@ -512,13 +510,12 @@ async def show_all_words(callback: types.CallbackQuery):
 
     lines = [f"📚 <b>Все слова ({len(words)})</b>\n"]
 
-    # Группируем по первой букве
     current_letter = None
     for _, article, word, translation in words:
         first = word[0].upper()
         if first != current_letter:
             if current_letter is not None:
-                lines.append("")  # пустая строка между группами
+                lines.append("")
             lines.append(f"— <b>{first}</b> —")
             current_letter = first
         lines.append(format_word(article, word, translation))
@@ -680,7 +677,7 @@ async def add_word_translation(message: types.Message, state: FSMContext):
     await state.clear()
 
 
-# ---------- NEW: Удаление слов ----------
+# ---------- Удаление слов ----------
 @dp.callback_query(F.data == "delete_start")
 async def delete_start(callback: types.CallbackQuery):
     role = get_role(callback.from_user.username)
@@ -835,6 +832,135 @@ async def add_hw_text(message: types.Message, state: FSMContext):
         reply_markup=main_menu(role),
     )
     await state.clear()
+
+
+# ---------- Диагностика (только админ) ----------
+@dp.message(F.text == "🛠 Диагностика")
+async def diagnostic_handler(message: types.Message, state: FSMContext):
+    role = get_role(message.from_user.username)
+    if role != "admin":
+        return
+    await state.clear()
+    await message.answer(
+        "Меню диагностики:",
+        reply_markup=diagnostic_menu(),
+    )
+
+
+# «Старт»
+@dp.message(F.text == "▶️ Старт")
+async def diag_start(message: types.Message, state: FSMContext):
+    role = get_role(message.from_user.username)
+    if role != "admin":
+        return
+    await state.clear()
+
+    text = (
+        "⚠️ <b>Началась тех. работа над ботом.</b>\n"
+        "Не используйте бота, пока видите это сообщение последним."
+    )
+    await broadcast_text(text)
+    await message.answer("✅ Сообщение разослано.", reply_markup=diagnostic_menu())
+
+
+# «Обновление» — запрашиваем текст
+@dp.message(F.text == "🔄 Обновление")
+async def diag_update_start(message: types.Message, state: FSMContext):
+    role = get_role(message.from_user.username)
+    if role != "admin":
+        return
+
+    await state.set_state(Broadcast.update_text)
+    await message.answer(
+        "Напиши, что нужно добавить в сообщение об обновлении:",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+# Получаем текст обновления и рассылаем
+@dp.message(Broadcast.update_text)
+async def diag_update_send(message: types.Message, state: FSMContext):
+    role = get_role(message.from_user.username)
+    if role != "admin":
+        await state.clear()
+        return
+
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=diagnostic_menu())
+        return
+
+    admin_text = message.text.strip()
+
+    text = (
+        f"🔄 <b>БОТ ОБНОВЛЕН</b>\n\n"
+        f"{admin_text}\n\n"
+        f"Напишите /start чтобы обновить бота"
+    )
+    await broadcast_text(text)
+    await message.answer(
+        "✅ Сообщение об обновлении разослано.",
+        reply_markup=diagnostic_menu(),
+    )
+    await state.clear()
+
+
+# «Рассылка» — запрашиваем текст
+@dp.message(F.text == "📢 Рассылка")
+async def diag_custom_start(message: types.Message, state: FSMContext):
+    role = get_role(message.from_user.username)
+    if role != "admin":
+        return
+
+    await state.set_state(Broadcast.custom_text)
+    await message.answer(
+        "Напиши текст, который нужно отправить всем пользователям.\n"
+        "Можно использовать HTML: <b>жирный</b>, <i>курсив</i>, "
+        "<a href=\"https://example.com\">ссылка</a>.",
+        parse_mode="HTML",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+# Получаем произвольный текст и рассылаем
+@dp.message(Broadcast.custom_text)
+async def diag_custom_send(message: types.Message, state: FSMContext):
+    role = get_role(message.from_user.username)
+    if role != "admin":
+        await state.clear()
+        return
+
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=diagnostic_menu())
+        return
+
+    custom_text = message.text.strip()
+
+    text = f"📢 <b>Сообщение от администратора:</b>\n\n{custom_text}"
+
+    await broadcast_text(text)
+    await message.answer(
+        "✅ Сообщение разослано всем пользователям.",
+        reply_markup=diagnostic_menu(),
+    )
+    await state.clear()
+
+
+# «Конец»
+@dp.message(F.text == "⏹ Конец")
+async def diag_end(message: types.Message, state: FSMContext):
+    role = get_role(message.from_user.username)
+    if role != "admin":
+        return
+    await state.clear()
+
+    text = (
+        "✅ <b>Тех. работы завершились.</b>\n"
+        "Напишите /start чтобы начать пользоваться ботом."
+    )
+    await broadcast_text(text)
+    await message.answer("✅ Сообщение разослано.", reply_markup=diagnostic_menu())
 
 
 # ---------- Назад ----------
